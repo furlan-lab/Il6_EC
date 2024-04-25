@@ -1,0 +1,1025 @@
+---
+title: "cdsi Load"
+author: OW_SSB
+output: html_myeebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r  warning=FALSE, message=FALSE, warning=FALSE, echo=F}
+rm(list=ls())
+ROOT_DIR<-"/fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt"
+DATA_DIR <- file.path(ROOT_DIR, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR,  "res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR,  "rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,   "cds")
+FIG_DIR <- file.path(ROOT_DIR,  "figs")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(m3addon)
+  library(dplyr)
+  library(Matrix)
+  library(reticulate)
+  library(ggplot2)
+  library(pals)
+  library(RColorBrewer)
+  library(Seurat)
+  library(ComplexHeatmap)
+  library(ArchR)
+  library(Biobase)
+  library(stringr)
+  library(viridis)
+  library(Seurat)
+  library(scCustomize)
+  library(scRepertoire)
+  #library(SCpubr)
+  library(forcats)
+  library(ggalluvial)
+  library(future)
+  library(pbmcapply)
+  library(parallel)
+  library(dplyr)
+  library(msigdbr)
+  library(fgsea)
+  library(stringr)
+  library(harmony)
+  library(future)
+  library(ggplot2)
+  library(circlize)
+  library(clusterProfiler)
+  library(scales)
+  library(ggrepel)
+  #library(enrichR)
+  library(ggpubr)
+  library(presto)
+  library(tibble)
+})
+
+set.seed(1234)
+
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+library(RcppArrayFire)
+library(viewmastR)
+# plan("multisession", workers = 12)
+# options(future.globals.maxSize = 6000000000 * 1024^2)
+```
+
+#load object and colors
+```{r}
+seu<-readRDS(file.path(CDS_DIR, "230602_GVHD_EC_seu.RDS"))
+
+rna_cols<-paletteContinuous(n=8)[c(1:3, 6:8)]
+
+group_cols<-c("noGVHD_EC_TCD" = "gray10", "GVHD_EC_WT" = "#1d1db8", "GVHD_EC_IL6R" = "#f76b14", "GVHD_EC_Ifngko" = "#20B2AA")
+
+clus_cols<-c("#000000", "#5A5CBB", "#0E3660", "#CE2D3F", "#A6366B" ,"#7F3F98", "#FCB31A", "#1C6CC0", "#3679DE", "#F17B20", "#E74426")
+names(clus_cols)<-levels(factor(seu$seurat_clusters))
+```
+
+export to geo
+```{r prepare for GEO}
+setwd("/fh/fast/hill_g/10x/GVHD_EC_expt")
+meta<-seu@meta.data[,c(1:10,12)]
+names(meta)
+meta$UMAP_1<-seu@reductions$umap@cell.embeddings[,1]
+meta$UMAP_2<-seu@reductions$umap@cell.embeddings[,2]
+
+write.csv(meta, file.path( "geo_upload/metadata.csv"))
+```
+
+```{r export processed matrices}
+sct_mat<-seu@assays$SCT@data %>% as.sparse()
+
+write.csv(sct_mat, file.path("geo_upload/rna_counts_processed.csv"))
+```
+
+```{bash}
+ncftp
+set passive on
+set so-bufsize 33554432
+open ftp://geoftp:inAlwokhodAbnib5@ftp-private.ncbi.nlm.nih.gov
+cd uploads/owaltner@orcid_MlmJa2eM
+put -R /fh/fast/hill_g/10X/GVHD_EC_expt/GVHD_EC_geo_upload
+
+
+```
+
+```{bash}
+cd /fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt/geo_upload
+md5sum rna_counts_processed.csv
+#f2a01b9c6ee751a97ddeda99301da43a
+md5sum metadata.csv
+#edfeaa082abe9797b4033be75dd905da
+md5sum TCD_sample_alignments.bam
+#58d41b24529af94857c1efb0b98967ac 
+md5sum WT_sample_alignments.bam
+#74f69388e4762486ac4229daeacefada
+md5sum IfngKO_sample_alignments.bam
+#432d28a64e0fe506a27e89b78791a5db
+```
+/fh/fast/hill_g/10X/GVHD_EC_expt/geo_upload
+#Dim Plot
+```{r}
+pdf("/fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt/figs/dataset_umap_scpubr.pdf", width =6, height =6)
+p2 <- SCpubr::do_DimPlot(sample = seu, colors.use = group_cols, group.by = "dataset")
+p2
+
+dev.off()
+
+pdf("/fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt/figs/dataset_split.pdf", width = 12, height = 5)
+DimPlot(seu, group.by = "dataset", cols = group_cols, split.by = "dataset")&NoAxes()
+dev.off()
+
+pdf("/fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt/figs/seurat_clusters_umap_scpubr.pdf", width = 6, height = 6)
+SCpubr::do_DimPlot(sample = seu, colors.use = clus_cols, group.by = "seurat_clusters", label.box = T, label = T)
+dev.off()
+```
+
+
+#Make Object
+```{r load data make assays}
+# Load the dataset
+dirs<-list.files(DATA_DIR)
+fileroot<-file.path(DATA_DIR, "SAMPLE/outs/per_sample_outs/SAMPLE/count/sample_filtered_feature_bc_matrix.h5")
+files<-sapply(dirs, function(dir) gsub("SAMPLE", dir, fileroot))
+
+files<-files[c(1, 3:4)]
+
+#install.packages("hdf5r")
+#library(hdf5r)
+i<-files[1]
+seus<-pbmclapply(files, function(i){
+  #get file name 
+  name<-str_split(i, "/") %>% sapply("[[", 8)
+  
+  #read raw data
+  seu<-Read10X_h5(i)
+  
+  #export as sparse for scrublet
+  rna_mat<-seu
+  exprData <- Matrix(as.matrix(rna_mat), sparse = TRUE)
+  writeMM(exprData, file.path(ROOT_DIR,"scrublet_files", paste0(name, "_matrix.mtx")))
+  
+  #return seurat
+  seu
+}, mc.cores = detectCores())
+
+seuG <- lapply(seus, function(i) CreateSeuratObject(counts = i))
+```
+
+#remove gex doublets
+```{bash install conda}
+# run in terminal
+ml fhPython/3.8.6-foss-2020b-Python-3.8.6 
+ml Anaconda3/2022.05
+conda create -n py3 python=3
+source activate py3
+pip install scrublet
+```
+
+```{r set up python enrionment}
+Sys.setenv(RETICULATE_PYTHON = "~/.conda/envs/py3/bin/python3")
+library("reticulate")
+use_python("~/.conda/envs/py3/bin/python3")
+use_condaenv("~/.conda/envs/py3")
+py_config()
+```
+
+```{python}
+import scrublet as scr
+import scipy.io
+import numpy as np
+import os
+
+#Load raw counts matrix and gene list
+input_dir = '/fh/fast/furlan_s/experiments/Ping_GVHD_EC_expt/scrublet_files'
+
+counts_matrix1 = scipy.io.mmread(input_dir + '/GVHD_EC_Ifngko_matrix.mtx').T.tocsc()
+
+#Initialize Scrublet object
+scrub1 = scr.Scrublet(counts_matrix1,
+                     expected_doublet_rate=0.1,
+                     sim_doublet_ratio=2,
+                     n_neighbors = 8)
+
+#Run the default pipeline
+doublet_scores1, predicted_doublets1 = scrub1.scrub_doublets(min_counts=1, 
+                                                         min_cells=3, 
+                                                          min_gene_variability_pctl=85, 
+                                                          n_prin_comps=25)
+                                                          
+                                                        
+                                                          
+counts_matrix3 = scipy.io.mmread(input_dir + '/GVHD_EC_WT_matrix.mtx').T.tocsc()
+
+#Initialize Scrublet object
+scrub3 = scr.Scrublet(counts_matrix3,
+                     expected_doublet_rate=0.1,
+                     sim_doublet_ratio=2,
+                     n_neighbors = 8)
+
+#Run the default pipeline
+doublet_scores3, predicted_doublets3 = scrub3.scrub_doublets(min_counts=1, 
+                                                          min_cells=3, 
+                                                          min_gene_variability_pctl=85, 
+                                                          n_prin_comps=25)
+                                                          
+counts_matrix4 = scipy.io.mmread(input_dir + '/noGVHD_EC_TCD_matrix.mtx').T.tocsc()
+
+#Initialize Scrublet object
+scrub4 = scr.Scrublet(counts_matrix4,
+                     expected_doublet_rate=0.1,
+                     sim_doublet_ratio=2,
+                     n_neighbors = 8)
+
+#Run the default pipeline
+doublet_scores4, predicted_doublets4 = scrub4.scrub_doublets(min_counts=1, 
+                                                          min_cells=3, 
+                                                          min_gene_variability_pctl=85, 
+                                                          n_prin_comps=25)
+                                                          
+```
+
+```{r}
+seuG <- lapply(seus, function(i) CreateSeuratObject(counts = i))
+doub_scores<-list(py$doublet_scores1, py$doublet_scores3, py$doublet_scores4)
+
+# Import scrublet's doublet score
+seuG[[1]]$Doubletscore <- py$doublet_scores1
+seuG[[2]]$Doubletscore <- py$doublet_scores3
+seuG[[3]]$Doubletscore <- py$doublet_scores4
+
+seu <- merge(
+  x = seuG[[1]],
+  y = seuG[2:length(seuG)], add.cell.ids = dirs[c(1,3:4)]
+)
+
+# Plot doublet score
+ggplot(seu@meta.data, aes(x = Doubletscore, stat(ndensity))) +
+  geom_histogram(bins = 200, colour ="lightgrey")+
+  geom_vline(xintercept = 0.23, colour = "red", linetype = 2)+
+  geom_vline(xintercept = 0.15, colour = "green", linetype = 2) # Manually set threshold
+
+
+# Manually set threshold at doublet score to 0.15
+seu@meta.data$Predicted_doublets <- ifelse(seu$Doubletscore > 0.2, "Doublet","Singlet" )
+table(seu@meta.data$Predicted_doublets)
+```
+
+#RNA QC
+```{r subset RNA}
+DefaultAssay(seu)<-"RNA"
+
+seu$dataset<-seu$orig.ident
+
+for(i in dirs[c(1,3:4)]){
+  seu$dataset[grep(i, colnames(seu))]<-i
+}
+
+table(seu$dataset)
+#add percent.mt to metadata
+seu$percent.mt <- PercentageFeatureSet(seu, pattern = "^mt-")
+#add log_RNA to metadata
+seu$log_RNA<-log10(seu$nCount_RNA)
+
+# Visualize QC metrics as a violin plot
+VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "log_RNA", "percent.mt"), ncol = 4, pt.size = 0, group.by = "dataset")
+VlnPlot(seu, features = c("log_RNA"), pt.size = 0)
+VlnPlot(seu, "percent.mt", group.by = "dataset",pt.size = 0)+ylim(c(0,15))
+
+#subset RNA data, these are pretty straightforward parameters
+seu <- subset(seu, subset = log_RNA > 3.25 & log_RNA < 4.25 & percent.mt < 5 & Predicted_doublets == "Singlet")
+VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "log_RNA", "percent.mt"), ncol = 4, pt.size = 0, group.by = "dataset")
+```
+
+#Time to make a UMAP
+```{r reduce dimensions}
+# Note that all operations below are performed on the RNA assay Set and verify that the
+# default assay is RNA
+DefaultAssay(seu) <- "RNA"
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu, features = VariableFeatures(seu))
+seu <- SCTransform(seu, vars.to.regress = "percent.mt", verbose = T) ## if you do SCT transform it will normalize so no need to Normalize separately
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seu <- RunPCA(seu, verbose = T)
+ElbowPlot(seu, 50)
+
+Reductions(seu)
+seu <- RunUMAP(seu, dims = 1:30, verbose = T, reduction = "pca")
+
+#30 dims looks good, you wanna pick the # of PCs when it starts to plateau
+# perform visualization and clustering steps
+seu <- FindNeighbors(seu, dims = 1:30, verbose = T)
+seu <- FindClusters(seu, verbose = T, resolution = 1) ##increase resolution to increase # clusters, vice versa
+#the # of clusters will depend on what's biologically relevant
+DimPlot(seu, cols = sfc(27), label = T, label.box = T, group.by = "seurat_clusters")+scale_fill_manual(values = rep("white", 27))
+```
+
+```{r reduce dimensions}
+seu<-seu[,!seu$seurat_clusters %in% c(26,22,24, 25)]
+
+## run umap after deleting satellite clusters
+seu <- RunUMAP(seu, dims = 1:25, verbose = T)
+DimPlot(seu, group.by = "seurat_clusters", label = T, label.box = T)
+DimPlot(seu, cols = group_cols, label = T, label.box = T, group.by = "dataset")+scale_fill_manual(values = rep("white", 24))
+
+seu<-seu[,!seu$seurat_clusters %in% c(23)]
+## run umap after deleting satellite clusters
+seu <- RunUMAP(seu, dims = 1:20, verbose = T)
+DimPlot(seu, cols = sfc(23), label = T, label.box = T)+scale_fill_manual(values = rep("white", 23))
+seu <- FindClusters(seu, verbose = T, resolution = 0.3, method = 2) ##increase resolution to increase # clusters, vice versa
+
+DimPlot(seu, cols = clus_cols, label = T, label.box = T)+scale_fill_manual(values = rep("white", 12))
+
+saveRDS(seu, file.path(CDS_DIR, "230602_GVHD_EC_seu.RDS"))
+```
+
+#GSEA analysis
+```{r plot individual gene sets}
+##Mouse Gene Set: Hallmark_apoptosis, Hallmark_Glycolysis,GOBP_RESPONSE_TO_INTERLEUKIN_6, BIOCARTA_NFKB_PATHWAY, BIOCARTA_IFNG_PATHWAY,REACTOME_NF_KB_IS_ACTIVATED_AND_SIGNALS_SURVIVAL, oxphos
+
+## Oxphos
+m_df<-msigdbr(species = "Mus musculus", category = "H")
+oxphos<-m_df[m_df$gs_name == "HALLMARK_OXIDATIVE_PHOSPHORYLATION",]$gene_symbol
+
+## BIOCARTA_NFKB_PATHWAY
+m_df<- msigdbr(species = "Mus musculus", category = "C2", subcategory = "CP:BIOCARTA")
+nfkb<-m_df[m_df$gs_name == "BIOCARTA_NFKB_PATHWAY",]$gene_symbol
+
+## Hallmark_apoptosis
+m_df<-msigdbr(species = "Mus musculus", category = "H")
+apop<-m_df[m_df$gs_name == "HALLMARK_APOPTOSIS",]$gene_symbol
+
+## GOBP_RESPONSE_TO_INTERLEUKIN_6
+m_df<- msigdbr(species = "Mus musculus", category = "C5", subcategory = "GO:BP")
+go_IL6<-m_df[m_df$gs_name == "GOBP_RESPONSE_TO_INTERLEUKIN_6",]$gene_symbol
+
+## Hallmark_glycolysis
+m_df<- msigdbr(species = "Mus musculus", category = "H")
+glyco<-m_df[m_df$gs_name == "HALLMARK_GLYCOLYSIS",]$gene_symbol
+
+#BIOCARTA_IFNG_PATHWAY
+m_df<- msigdbr(species = "Mus musculus", category = "C2", subcategory = "CP:BIOCARTA")
+ifng<-m_df[m_df$gs_name == "BIOCARTA_IFNG_PATHWAY",]$gene_symbol
+
+## REACTOME_NF_KB_IS_ACTIVATED_AND_SIGNALS_SURVIVAL
+m_df<- msigdbr(species = "Mus musculus", category = "C2", subcategory = "CP:REACTOME")
+surv<-m_df[m_df$gs_name == "REACTOME_NF_KB_IS_ACTIVATED_AND_SIGNALS_SURVIVAL",]$gene_symbol
+
+
+
+seu<-AddModuleScore(seu, features = list(apop), name = "apop")
+seu<-AddModuleScore(seu, features = list(go_IL6), name = "go_Il6")
+seu<-AddModuleScore(seu, features = list(glyco), name = "glyco")
+seu<-AddModuleScore(seu, features = list(surv), name = "surv")
+seu<-AddModuleScore(seu, features = list(ifng), name = "ifng")
+seu<-AddModuleScore(seu, features = list(oxphos), name = "oxphos")
+seu<-AddModuleScore(seu, features = list(nfkb), name = "nfkb")
+
+
+## Vln plots
+my_comparisons <- list( c("GVHD_EC_Ifngko","noGVHD_EC_TCD"), c("GVHD_EC_IL6R", "GVHD_EC_WT"))
+
+VlnPlot(seu, features = "apop1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 0.5)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="Apoptosis")
+
+VlnPlot(seu, features = "go_Il61", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 0.8)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="IL6")
+
+VlnPlot(seu, features = "glyco1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 0.4)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="Glycolysis")
+
+VlnPlot(seu, features = "surv1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 1.5)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="some_survival")
+
+VlnPlot(seu, features = "ifng1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 1.5)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="IFNG")
+
+VlnPlot(seu, features = "oxphos1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 1.5)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="Oxidative phosphorylation")
+
+VlnPlot(seu, features = "nfkb1", group.by = "dataset", cols = group_cols, pt.size =0, y.max = 0.8)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons)+ggtitle(label="NFKB")
+
+```
+
+```{r Individual pathways GSEA plots -- helper functions}
+Idents(seu)<- "dataset"
+seu$dataset %>% table()
+
+markers<-read.csv(file.path(RES_DIR, "dataset-markers.csv"))
+
+gsea_barplot<-function(marker_df, dataset, category, subcategory = NULL, top_n, plot){
+  dataset.genes<- marker_df %>%
+    dplyr::filter(cluster == dataset) %>%
+    dplyr::filter(!str_detect(gene ,"^Rpl")) %>%
+    dplyr::filter(!str_detect(gene, "^Rps"))%>%
+    dplyr::filter(!str_detect(gene, "^mt-"))%>%
+    arrange(desc(avg_log2FC)) %>% 
+    dplyr::select(gene, avg_log2FC)
+  
+  ranks<- deframe(dataset.genes)
+
+  
+  m_df<-msigdbr(species = "Homo sapiens", category = category, subcategory = subcategory)
+  fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+  
+  fgseaRes<- fgsea(fgsea_sets, stats = ranks, nperm = 1000)
+  
+  fgseaResTidy <- fgseaRes %>%
+    as_tibble() %>%
+    arrange(desc(NES))
+  
+
+  ## BAr plot with normalized enrichment score
+  # only plot the top 20 pathways
+  if(plot == T){
+    ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% slice_max(abs(NES), n =top_n), aes(reorder(pathway, NES), NES)) +
+    geom_col() +
+    coord_flip() +
+    labs(x="Pathway", y="Normalized Enrichment Score",
+         title="Hallmark pathways NES from GSEA") + 
+    theme_minimal()+ggtitle(label=paste0(dataset, "_", category))
+  }else{
+    return(list(ranks, fgsea_sets, fgseaResTidy))
+  }
+}
+
+gsea_plot<-function(dat, pathway, title){
+  fgsea_sets<-dat[[2]]
+  ranks<-dat[[1]]
+  res<-dat[[3]]
+  nes<-res[res$pathway ==pathway,]$NES
+  pval<-res[res$pathway ==pathway,]$pval
+  
+  
+  p<-plotEnrichment(fgsea_sets[[pathway]],
+                    ranks) + labs(title=title, subtitle = paste0("NES:",round(nes,3), " pval:", round(pval,5)))
+  
+  p
+  
+}
+```
+
+```{r gsea dot plot}
+dat1<-gsea_barplot(markers, dataset = "GVHD_EC_Ifngko", category = "H", subcategory = NULL, top_n = 50, plot = F)
+dat2<-gsea_barplot(markers, dataset = "GVHD_EC_WT", category = "H", subcategory = NULL, top_n = 50, plot = F)
+dat3<-gsea_barplot(markers, dataset = "noGVHD_EC_TCD", category = "H", subcategory = NULL, top_n = 50, plot = F)
+
+dat1[[3]]$dataset<-"GVHD_EC_Ifngko"
+dat2[[3]]$dataset<-"GVHD_EC_WT"
+dat3[[3]]$dataset<-"noGVHD_EC_TCD"
+
+com_gsea<-rbind( dat1[[3]], dat2[[3]],dat3[[3]])
+x<-"GVHD_EC_Ifngko"
+#this gets the top ~100 terms per cluster based on pvalue & count, feel free to change the number as you see fit
+top_terms<-lapply(levels(factor(com_gsea$dataset)), function(x){
+  
+  top_gse_sub<-com_gsea %>% dplyr::filter(dataset == x & pval < 0.05) 
+  top_gse_filt<-top_gse_sub %>% slice_min(pval, n =20) %>% slice_max(size, n =20)
+  top_gse_filt$pathway
+  
+})
+
+#get unique top terms
+top_terms<-top_terms %>% unlist() %>% unique()
+
+#get values for top terms from each cluster
+results_sub<-com_gsea[com_gsea$pathway %in% top_terms,]
+
+#make sure to display significant values
+# results_sub<-results_sub[results_sub$pvalue< 0.00001,] #gobp
+results_sub<-results_sub[results_sub$pval< 0.05,] #hallmark
+
+#organize data frame by cluster
+results_sub<-results_sub %>% group_by(dataset)
+
+#order levels to make plotting nice :)
+results_sub$pathway<-factor(results_sub$pathway, levels =rev(unique(results_sub$pathway)))
+results_sub$dataset<-factor(results_sub$dataset, levels =unique(results_sub$dataset))
+
+ggplot(results_sub, aes(x = pathway, y = dataset, size = size, fill = NES))+
+geom_point(shape = 21, color="black")+
+theme_ArchR(legendPosition = "right")+
+RotatedAxis()+
+coord_flip()+
+scale_fill_gradientn(colors = paletteContinuous(set = "coolwarm", reverse = F))&NoGrid()
+
+
+```
+
+```{r Individual pathways GSEA plots -- IFNG}
+### GSEA barplots across dataset for database (Hallmark, GOBP)
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_Ifngko", category = "H", subcategory = NULL, top_n = 50, plot = F)
+p<-gsea_plot(dat, pathway = "HALLMARK_INTERFERON_GAMMA_RESPONSE", title = "GVHD_EC_Ifngko")
+
+  
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_WT", category = "H", subcategory = NULL, top_n = 50, plot = F)
+q<-gsea_plot(dat, pathway = "HALLMARK_INTERFERON_GAMMA_RESPONSE", title = "GVHD_EC_WT")
+
+dat<-gsea_barplot(markers, dataset = "noGVHD_EC_TCD", category = "H", subcategory = NULL, top_n = 50, plot = F)
+t<-gsea_plot(dat, pathway = "HALLMARK_INTERFERON_GAMMA_RESPONSE", title = "noGVHD_EC_TCD")
+
+p/q/t
+```
+
+```{r Individual pathways GSEA plots -- apoptosis}
+### GSEA barplots across dataset for database (Hallmark, GOBP)
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_Ifngko", category = "H", subcategory = NULL, top_n = 50, plot = F)
+p<-gsea_plot(dat, pathway = "HALLMARK_APOPTOSIS", title = "GVHD_EC_Ifngko")
+
+  
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_WT", category = "H", subcategory = NULL, top_n = 50, plot = F)
+q<-gsea_plot(dat, pathway = "HALLMARK_APOPTOSIS", title = "GVHD_EC_WT")
+
+dat<-gsea_barplot(markers, dataset = "noGVHD_EC_TCD", category = "H", subcategory = NULL, top_n = 50, plot = F)
+t<-gsea_plot(dat, pathway = "HALLMARK_APOPTOSIS", title = "noGVHD_EC_TCD")
+
+p/q/t
+```
+
+```{r Individual pathways GSEA plots -- Tnfa/Nfkb}
+### GSEA barplots across dataset for database (Hallmark, GOBP)
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_Ifngko", category = "H", subcategory = NULL, top_n = 50, plot = F)
+p<-gsea_plot(dat, pathway = "HALLMARK_TNFA_SIGNALING_VIA_NFKB", title = "GVHD_EC_Ifngko")
+
+  
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_WT", category = "H", subcategory = NULL, top_n = 50, plot = F)
+q<-gsea_plot(dat, pathway = "HALLMARK_TNFA_SIGNALING_VIA_NFKB", title = "GVHD_EC_WT")
+
+dat<-gsea_barplot(markers, dataset = "noGVHD_EC_TCD", category = "H", subcategory = NULL, top_n = 50, plot = F)
+t<-gsea_plot(dat, pathway = "HALLMARK_TNFA_SIGNALING_VIA_NFKB", title = "noGVHD_EC_TCD")
+
+p/q/t
+```
+
+```{r Individual pathways GSEA plots -- JAK/STAT}
+markers$gene<-toupper(markers$gene) ##make human format
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_Ifngko",category = "C2", subcategory = "CP:KEGG", plot = F)
+p<-gsea_plot(dat, pathway = "KEGG_JAK_STAT_SIGNALING_PATHWAY", title = "GVHD_EC_Ifngko")
+
+dat<-gsea_barplot(markers, dataset = "GVHD_EC_WT",category = "C2", subcategory = "CP:KEGG", plot = F)
+q<-gsea_plot(dat, pathway = "KEGG_JAK_STAT_SIGNALING_PATHWAY", title = "GVHD_EC_WT")
+
+dat<-gsea_barplot(markers, dataset = "noGVHD_EC_TCD",category = "C2", subcategory = "CP:KEGG", plot = F)
+t<-gsea_plot(dat, pathway = "KEGG_JAK_STAT_SIGNALING_PATHWAY", title = "noGVHD_EC_TCD")
+
+p/q/t
+```
+
+```{r which ifng pathways genes are highly expressed}
+ifng_genes<-dat[[2]]$HALLMARK_INTERFERON_GAMMA_RESPONSE
+ifng_genes<-ifng_genes[which(ifng_genes %in% rownames(seu))]
+ifng_mat<-seu@assays$SCT@data[ifng_genes %>% unique(),]
+expr_df<-data.frame(gene = rownames(ifng_mat), meanexpr = rowMeans(ifng_mat))
+
+ggplot(expr_df, aes(x = meanexpr))+geom_density(color="darkblue", fill="lightblue")+geom_vline(xintercept =1, color = "red", linetype = "dashed")+theme_classic()
+
+high_ifng_genes<-expr_df[expr_df$meanexpr > 1,]$gene
+
+FeaturePlot_scCustom(seu, features = high_ifng_genes, colors_use = rna_cols)&NoAxes()
+```
+
+#pathway activity
+```{r get activities}
+# Define your sample and assay.
+sample <- seu
+assay <- "SCT"
+
+# Retrieve prior knowledge network.
+network <- decoupleR::get_progeny(organism = "mouse")
+
+# Run weighted means algorithm.
+activities <- decoupleR::run_wmean(mat = sample@assays[[assay]]@data,
+                                   network = network,
+                                   .source = "source",
+                                   .targe = "target",
+                                   .mor = "weight",
+                                   times = 100,
+                                   minsize = 5)
+```
+
+```{r activities  - vln plots}
+table(seu$dataset)
+
+activities$dataset[grep("GVHD_EC_Ifngko",activities$condition)]<- "GVHD_EC_Ifngko"
+activities$dataset[grep("GVHD_EC_WT",activities$condition)]<- "GVHD_EC_WT"
+activities$dataset[grep("noGVHD_EC_TCD",activities$condition)]<- "noGVHD_EC_TCD"
+
+activities$dataset<-factor(activities$dataset, levels = c("noGVHD_EC_TCD", "GVHD_EC_WT","GVHD_EC_Ifngko"))
+table(activities$source)
+
+my_comparisons= list( c("GVHD_EC_Ifngko","noGVHD_EC_TCD"), c("GVHD_EC_Ifngko", "GVHD_EC_WT"),c("GVHD_EC_WT", "noGVHD_EC_TCD"))
+
+jak_stat_activities <- activities[activities$source == "JAK-STAT" & (activities$score >0 & activities$score < quantile(activities[activities$source == "JAK-STAT",]$score, 0.7)),]
+
+pdf(file.path(FIG_DIR, "JAK-STAT_vlnplot.pdf"), width =4, height = 5)
+ggplot(jak_stat_activities, aes(x = dataset, y =score, fill=dataset))+geom_violin()+scale_fill_manual(values = group_cols)+theme_classic()+ylim(c(0,2))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons, aes(label = ..p.signif..))+ggtitle(label="JAK/STAT")+RotatedAxis()
+dev.off()
+
+table(activities$source)
+tnfa_activities <- activities[activities$source == "TNFa" & (activities$score >0 & activities$score < quantile(activities[activities$source == "TNFa",]$score, 0.7)),]
+
+pdf(file.path(FIG_DIR, "TNFa_vlnplot.pdf"), width =4, height = 5)
+ggplot(tnfa_activities, aes(x = dataset, y =score, fill=dataset))+geom_violin()+scale_fill_manual(values = group_cols)+theme_classic()+ylim(c(0,2))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons, aes(label = ..p.signif..))+ggtitle(label="TNFa")+RotatedAxis()
+dev.off()
+
+
+NFkB_activities <- activities[activities$source == "NFkB" & (activities$score >0 & activities$score < quantile(activities[activities$source == "NFkB",]$score, 0.7)),]
+
+pdf(file.path(FIG_DIR, "NFkB_vlnplot.pdf"), width =4, height = 5)
+ggplot(NFkB_activities, aes(x = dataset, y =score, fill=dataset))+geom_violin()+scale_fill_manual(values = group_cols)+theme_classic()+ylim(c(0,1.5))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")+ggpubr::stat_compare_means(comparisons = my_comparisons, aes(label = ..p.signif..))+ggtitle(label="NFkB")+RotatedAxis()
+dev.off()
+
+```
+
+```{r activities -- feature plots}
+out <- activity_plot(sample = sample,activities = activities, plot_FeaturePlots = T, plot_Heatmaps = F, pt.size = 0.3, enforce_symmetry = T)
+
+pdf(file.path(FIG_DIR, "NFkB_activity_umap.pdf"), width = 6, height =7)
+out$feature_plots$NFkB
+dev.off()
+
+pdf(file.path(FIG_DIR, "Tnfa_activity_umap.pdf"), width= 6, height =7)
+out$feature_plots$TNFa
+dev.off()
+
+pdf(file.path(FIG_DIR, "Jak_STAT_activity_umap.pdf"), width= 6, height =7)
+out$feature_plots$`JAK-STAT`
+dev.off()
+```
+
+```{r activities -- heatmap}
+# Define your sample and assay.
+seu$dataset<-factor(seu$dataset, levels= c("noGVHD_EC_TCD", "GVHD_EC_WT", "GVHD_EC_Ifngko") %>% rev())
+out <- SCpubr::do_PathwayActivityPlot(sample = seu,
+                                      activities = activities, cluster_rows = F)
+p <- out$heatmaps$average_scores
+p
+```
+
+
+#marker genes
+```{r}
+rownames(seu)[grep("^Ci", rownames(seu))]
+DefaultAssay(seu)<-"SCT"
+
+FeaturePlot_scCustom(seu, features = "Mki67")
+
+features<- c("Igtp", "Gbp2", "Gbp4", "Aass", "Car4", "Cyp26b1", "Ubd", "Tubb3", "Egr1", "Wars", "Ctgf", "Fgf23", "Fos", "Fosb", "Jun", "Hspa1a", "Hspa1b", "Btg2", "Ltbp4", "Gja4", "Cd274", "Ly6c1","Ly6a", "Cxcl9", "Cxcl10", "Itgb3", "Cd47", "H2-Ab1", "H2-Eb1", "H2-Aa", "Clec1b")
+
+for(i in 1:length(features)){
+  pdf(file.path(FIG_DIR,"marker_umap", paste0( features[i], "_umap.pdf")), width = 4, height =4)
+  print(FeaturePlot_scCustom(seu, features = features[i], colors_use = rna_cols, raster = F)&NoAxes())
+  dev.off()
+}
+pdf(file.path(FIG_DIR, "markers_exp_group_dot_plot.pdf"), width = 8, height =3)
+SCpubr::do_DotPlot(seu, features = features, colors.use = rna_cols, group.by = "dataset")
+dev.off()
+
+SCpubr::do_FeaturePlot()
+SCpubr::do_FeaturePlot(seu, features = "Ly6a", order = T)+scale_color_gradientn(colors = rna_cols)
+
+for(i in 1:length(features)){
+  pdf(file.path(FIG_DIR,"marker_umap_scpubr", paste0( features[i], "_umap.pdf")), width = 6, height =6)
+  print(SCpubr::do_FeaturePlot(seu, features = features[i], order =T)+scale_color_gradientn(colors = rna_cols))
+  dev.off()
+}
+```
+
+#find markers across exp groups
+```{r}
+markers<-read.csv(file.path(RES_DIR, "dataset-markers.csv"))
+
+top_n<-markers %>% group_by(cluster) %>% slice_max(avg_log2FC, n=20)
+
+seu_avg<-AverageExpression(seu, assay ="RNA", group.by = "dataset", return.seurat = T)
+
+rna_mat<-seu_avg@assays$RNA@data[top_n$gene %>% unique(),]
+rna_mat<-t(scale(t(rna_mat)))
+
+col_fun = circlize::colorRamp2(quantile(rna_mat, c(0.1,0.3,0.5,0.6,0.9, 0.99)), rna_cols)
+
+pdf(file.path(FIG_DIR, "dataset_top_markers_heatmap.pdf"), width =3.25, height = 10)
+Heatmap(rna_mat, name = "RNA",  col =rna_cols, row_names_gp = gpar(fontsize = 12),  cluster_columns =T, width = 100, cluster_rows = T, show_column_dend = T, show_row_dend = T, use_raster = F, show_column_names =T, raster_quality = 4)
+dev.off()
+```
+
+#volcano plots
+```{r WT vs TCD}
+table(seu$dataset)
+Idents(seu)<-"dataset"
+markers<-FindMarkers(seu, ident.1 = "GVHD_EC_WT", ident.2 = "noGVHD_EC_TCD")
+markers$gene<-rownames(markers)
+markers$group<-ifelse(markers$avg_log2FC > 0, "GVHD_EC_WT", "noGVHD_EC_TCD")
+
+# write.csv(markers, file.path(RES_DIR, "GVHD_EC_WT_v_noGVHD_EC_TCD_markers.csv"))
+markers<-read.csv(file.path(RES_DIR, "GVHD_EC_WT_v_noGVHD_EC_TCD_markers.csv"))
+
+markers$neg_log_pval<- -log10(markers$p_val)
+markers$neg_log_pval[markers$neg_log_pval == "Inf"]<-300
+
+markers<- markers%>% dplyr::filter(!str_detect(gene ,"^Rpl")) %>%
+    dplyr::filter(!str_detect(gene, "^Rps"))%>%
+    dplyr::filter(!str_detect(gene, "^mt-"))
+
+top_n<-markers %>% group_by(group) %>% slice_max(abs(avg_log2FC), n = 10)
+
+genes<-unique(top_n$gene)
+
+library(EnhancedVolcano)
+# create custom key-value pairs for 'high', 'low', 'mid' expression by fold-change
+# this can be achieved with nested ifelse statements
+keyvals <- ifelse(
+  markers$avg_log2FC < -1, 'black',
+  ifelse(markers$avg_log2FC > 1, '#1d1db8',
+         'gray75'))
+keyvals[is.na(keyvals)] <- 'gray75'
+names(keyvals)[keyvals == 'black'] <- 'noGVHD_EC_TCD'
+names(keyvals)[keyvals == 'gray75'] <- 'NA'
+names(keyvals)[keyvals == '#1d1db8'] <- 'GVHD_EC_WT'
+
+pdf(file.path(FIG_DIR, "noGVHD_EC_TCD_v_GVHD_EC_WT_markers_volcano.pdf"), width = 7, height = 8)
+EnhancedVolcano(markers,
+                lab = markers$gene,
+                x = 'avg_log2FC',
+                y = 'p_val',
+                selectLab = genes,
+                xlab = bquote(~Log[2]~ 'fold change'),
+                title = 'noGVHD_EC_TCD_v_GVHD_EC_WT',
+                pCutoff = 1e-05,
+                pointSize = 4,
+                labSize = 4.75,
+                colCustom = keyvals,
+                max.overlaps = 20,
+                colAlpha = 1,
+                FCcutoff = 1,
+                legendLabSize = 15,
+                legendIconSize = 5.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black',
+                arrowheads = FALSE,
+                gridlines.major = F,
+                gridlines.minor = FALSE,
+                legendPosition = "bottom",
+                subtitle = NULL,
+                boxedLabels = T,
+                border = 'partial',
+                borderWidth = 1.5,
+                borderColour = 'black')
+dev.off()
+```
+
+```{r IFNGKO vs TCD}
+table(seu$dataset)
+Idents(seu)<-"dataset"
+markers<-FindMarkers(seu, ident.1 = "GVHD_EC_Ifngko", ident.2 = "noGVHD_EC_TCD")
+markers$gene<-rownames(markers)
+markers$group<-ifelse(markers$avg_log2FC > 0, "GVHD_EC_Ifngko", "noGVHD_EC_TCD")
+
+#write.csv(markers, file.path(RES_DIR, "GVHD_EC_Ifngko_v_noGVHD_EC_TCD_markers.csv"))
+markers<-read.csv(file.path(RES_DIR, "GVHD_EC_Ifngko_v_noGVHD_EC_TCD_markers.csv"))
+
+markers$neg_log_pval<- -log10(markers$p_val)
+markers$neg_log_pval[markers$neg_log_pval == "Inf"]<-300
+
+markers<- markers%>% dplyr::filter(!str_detect(gene ,"^Rpl")) %>%
+    dplyr::filter(!str_detect(gene, "^Rps"))%>%
+    dplyr::filter(!str_detect(gene, "^mt-"))
+
+top_n<-markers %>% group_by(group) %>% slice_max(abs(avg_log2FC), n = 10)
+
+genes<-unique(top_n$gene)
+
+library(EnhancedVolcano)
+# create custom key-value pairs for 'high', 'low', 'mid' expression by fold-change
+# this can be achieved with nested ifelse statements
+keyvals <- ifelse(
+  markers$avg_log2FC < -1, 'black',
+  ifelse(markers$avg_log2FC > 1, '#20B2AA',
+         'gray75'))
+keyvals[is.na(keyvals)] <- 'gray75'
+names(keyvals)[keyvals == 'black'] <- 'noGVHD_EC_TCD'
+names(keyvals)[keyvals == 'gray75'] <- 'NA'
+names(keyvals)[keyvals == '#20B2AA'] <- 'GVHD_EC_Ifngko'
+
+pdf(file.path(FIG_DIR, "GVHD_EC_Ifngko_v_GVHD_EC_WT_markers_volcano.pdf"), width = 7, height = 8)
+EnhancedVolcano(markers,
+                lab = markers$gene,
+                x = 'avg_log2FC',
+                y = 'p_val',
+                selectLab = genes,
+                xlab = bquote(~Log[2]~ 'fold change'),
+                title = 'noGVHD_EC_TCD_v_GVHD_EC_Ifngko',
+                pCutoff = 1e-05,
+                pointSize = 4,
+                labSize = 4.75,
+                colCustom = keyvals,
+                max.overlaps = 20,
+                colAlpha = 1,
+                FCcutoff = 1,
+                legendLabSize = 15,
+                legendIconSize = 5.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black',
+                arrowheads = FALSE,
+                gridlines.major = F,
+                gridlines.minor = FALSE,
+                legendPosition = "bottom",
+                subtitle = NULL,
+                boxedLabels = T,
+                border = 'partial',
+                borderWidth = 1.5,
+                borderColour = 'black')
+dev.off()
+```
+
+#cluster cells
+```{r}
+seu <- FindNeighbors(seu, dims = 1:20)
+seu <- FindClusters(seu, resolution = 0.3)
+
+DimPlot(seu, cols = clus_cols, label = T, label.box = T, group.by = "seurat_clusters")+scale_fill_manual(values = rep("white", 14))
+
+Idents(seu)<-"seurat_clusters"
+markers<-FindAllMarkers(seu)
+
+#write.csv(markers, file.path(RES_DIR, "seurat-clusters-10-markers.csv"))
+
+top_n<-markers %>% group_by(cluster) %>% slice_max(abs(avg_log2FC), n=5)
+
+seu_avg<-AverageExpression(seu, assay ="RNA", group.by = "seurat_clusters", return.seurat = T)
+
+rna_mat<-seu_avg@assays$RNA@data[top_n$gene %>% unique(),]
+rna_mat<-t(scale(t(rna_mat)))
+
+col_fun = circlize::colorRamp2(quantile(rna_mat, c(0.1,0.3,0.5,0.6,0.9, 0.99)), rna_cols)
+
+Heatmap(rna_mat, name = "RNA",  col =rna_cols, row_names_gp = gpar(fontsize = 12),  cluster_columns =T, width = 100, cluster_rows = T, show_column_dend = T, show_row_dend = T, use_raster = F, show_column_names =T, raster_quality = 4)
+```
+
+#barplot clusters, dataset
+```{r}
+df<- data.frame(table(seu$seurat_clusters, seu$dataset))
+ggplot(df, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = clus_cols)+theme_classic()+RotatedAxis()+NoGrid()
+```
+
+
+#graveyard
+```{r gsea across exp groups}
+library(Seurat)
+library(ArchR)
+library(clusterProfiler)
+library(msigdbr)
+library(ggplot2)
+library(dplyr)
+
+
+# Initialize a results table
+results <- data.frame(cluster_id = character(),
+                      geneID = character(),
+                      p_value = numeric(),
+                      ID = character(),
+                      Description = character(),
+                      BgRatio = character(),
+                      p.adjust = numeric(),
+                      Count = numeric(),
+                      qvalue = numeric(),
+                      stringsAsFactors = FALSE)
+
+DefaultAssay(seu)<-"RNA"
+Idents(seu)<-"dataset"
+markers<-FindAllMarkers(seu)
+
+# write.csv(markers, file.path(RES_DIR, "dataset-markers.csv"))
+markers<-read.csv(file.path(RES_DIR, "dataset-markers.csv"))
+
+#remove ribosomal and mitochondrial genes, make the strings upper case for human data
+markers<- markers  %>%  dplyr::filter(!str_detect(gene ,"^Rpl")) %>%
+    dplyr::filter(!str_detect(gene, "^Rps"))%>%
+    dplyr::filter(!str_detect(gene, "^mt-"))
+
+
+#Loop through each cluster and gene set, and perform enrichment analysis
+enrich_markers<-function(cluster_id, category, subcategory = NULL){
+  cluster_id <- cluster_id
+  #select positive markers , 0.2 is a reasonable cutoff
+  # marker_sub<-markers[markers$cluster == cluster_id & markers$avg_log2FC > 0.2,] 
+  # 
+  # make sure to select negative markers , -0.2 is a reasonable cutoff
+  marker_sub<-markers[markers$cluster == cluster_id & markers$avg_log2FC < -0.2,]
+  genes<-marker_sub$gene
+  
+  # you will need to change species, category, and subcategory to which MSigDB gene set you want
+  
+  #this selected homo spaiens, gene ontology: biological process
+  m_t2g <- msigdbr(species = "mouse", category = category, subcategory = subcategory) %>% 
+  dplyr::select(gs_name, gene_symbol) 
+
+  result <- enricher(gene =genes,
+                     TERM2GENE = m_t2g,
+                     pvalueCutoff = 0.05,
+                     universe = rownames(seu),
+                     qvalueCutoff = 0.05,
+                     pAdjustMethod = "BH")
+  if (length(result@result) > 0) {
+    results <- result@result
+    results$cluster_id<-cluster_id
+    return(results)
+  }else{
+    return(NULL)
+  }
+  
+}
+
+
+# # Use lapply to perform enrichment analysis for all cluster-gene set combinations
+results_list <- lapply(levels(factor(seu$dataset)),function(i){
+  enrich_markers(i, category = "C5", subcategory = "GO:BP")})
+
+results_list <- lapply(levels(factor(seu$dataset)),function(i){
+  enrich_markers(i, category = "H", subcategory = NULL)})
+
+# Flatten the results list and remove NULL elements
+results <- do.call(rbind, results_list)
+
+#this gets the top ~100 terms per cluster based on pvalue & count, feel free to change the number as you see fit
+top_terms<-lapply(levels(factor(results$cluster_id)), function(x){
+  
+  top_gse_sub<-results  %>% dplyr::filter(cluster_id == x & pvalue < 0.05) 
+  top_gse_filt<-top_gse_sub %>% slice_min(pvalue, n =10) %>% slice_max(Count, n =10)
+  top_gse_filt$Description
+  
+})
+
+#get unique top terms
+top_terms<-top_terms %>% unlist() %>% unique()
+
+#get values for top terms from each cluster
+results_sub<-results[results$Description %in% top_terms,]
+
+#make sure to display significant values
+results_sub<-results_sub[results_sub$pvalue< 0.00001,] #gobp
+results_sub<-results_sub[results_sub$pvalue< 0.05,] #hallmark
+
+#organize data frame by cluster
+results_sub<-results_sub %>% group_by(cluster_id)
+
+#order levels to make plotting nice :)
+results_sub$Description<-factor(results_sub$Description, levels =rev(unique(results_sub$Description)))
+results_sub$cluster_id<-factor(results_sub$cluster_id, levels =unique(results_sub$cluster_id))
+
+ggplot(results_sub, aes(x = Description, y = cluster_id, size = Count, fill = pvalue))+
+geom_point(shape = 21, color="black")+
+theme_minimal()+
+RotatedAxis()+
+coord_flip()+
+scale_fill_gradientn(colors = paletteContinuous(set = "whiteBlue", reverse = T))
+```
+#ligand receptor
+```{r}
+library(tidyverse)
+library(magrittr)
+library(liana)
+
+Idents(seu)<-"dataset"
+seu<-NormalizeData(seu)
+
+sce<-SingleCellExperiment(list(counts = seu@assays$RNA@counts,logcounts = LogNormalize(seu@assays$RNA@counts)))
+colData(sce)<-cbind(colData(sce), seu@meta.data)
+
+testdata<-seu
+
+rownames(testdata@assays$RNA@counts) <- stringr::str_to_title(rownames(testdata@assays$RNA@counts))
+rownames(testdata@assays$RNA@data) <- stringr::str_to_title(rownames(testdata@assays$RNA@data))
+
+# Here, we will convert LIANA's Consensus resource to murine symbols
+op_resource <- select_resource("Consensus")[[1]]
+
+# Generate orthologous resource
+ortholog_resource <- generate_homologs(op_resource = op_resource,
+                                       target_organism = 10090) # mouse
+
+# Run LIANA with the orthologous resource
+liana_res <- liana_wrap(testdata,
+                        resource = 'custom', # resource has to be set to 'custom' to work with external resources
+                        external_resource = ortholog_resource, # provide orthologous resource
+                        method=c('sca', 'natmi') # run only with sca and natmi for comp. time
+                        )
+
+# aggregate
+liana_res <- liana_res %>%
+    liana_aggregate()
+
+# Plot example
+liana_res %>%
+    filter(source=="B") %>%
+    filter(target %in% c("NK", "CD8 T")) %>%
+    liana_dotplot(source_groups = "B",
+                  target_groups = c("NK", "CD8 T"),
+                  ntop = 15)
+
+
+library(dplyr)
+library(tibble)
+p <- SCpubr::do_LigandReceptorPlot(liana_output = liana_res)
+p
+```
